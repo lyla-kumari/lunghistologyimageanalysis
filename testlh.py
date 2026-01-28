@@ -66,6 +66,21 @@ def read_rgb_from_bytes(b: bytes) -> np.ndarray:
     return arr.astype(np.uint8)
 
 
+def remove_exif_bytes(b: bytes) -> bytes:
+    """Return image bytes with any EXIF/metadata removed by re-saving as PNG in memory.
+    This prevents accidental leakage of identifying metadata when users upload images.
+    """
+    try:
+        img = Image.open(BytesIO(b))
+        rgb = img.convert("RGB")
+        out = BytesIO()
+        rgb.save(out, format="PNG")
+        return out.getvalue()
+    except Exception:
+        # If anything goes wrong, return the original bytes (best-effort)
+        return b
+
+
 def safe_stem(name: str) -> str:
     name = name or "image"
     return re.sub(r"[^A-Za-z0-9_.-]", "_", name)
@@ -706,6 +721,8 @@ def streamlit_app() -> None:
 
     # -------- Read bytes (no caching) --------
     data = uploaded.getvalue()  # reads file into memory; no disk write
+    # Strip EXIF/metadata from the uploaded bytes before decoding (privacy hardening)
+    data = remove_exif_bytes(data)
     rgb = read_rgb_from_bytes(data)
 
     params = {
@@ -765,7 +782,7 @@ def streamlit_app() -> None:
     # -------- Main outputs --------
     if show_images and show_original:
         st.subheader("Original image")
-        st.image(rgb, use_container_width=True)
+        st.image(rgb, width='stretch')
 
     if show_images and show_color_preview and color_target != "none":
         try:
@@ -779,7 +796,7 @@ def streamlit_app() -> None:
             preview = rgb.copy()
             preview[cm] = [255, 0, 0]
             st.subheader("Hue-target preview (red = selected pixels)")
-            st.image(preview, use_container_width=True)
+            st.image(preview, width='stretch')
             st.caption(f"Selected pixels: {int(cm.sum())}")
         except Exception:
             pass
@@ -806,17 +823,17 @@ def streamlit_app() -> None:
         ci=float(ci_level),
         seed=int(stats_seed),
     )
-    st.dataframe(stats_tbl, use_container_width=True)
+    st.dataframe(stats_tbl, width='stretch')
 
     st.subheader("Correlations (Pearson)")
     corr = corr_table(df, summary_cols)
     if corr.empty:
         st.write("Not enough numeric data.")
     else:
-        st.dataframe(corr, use_container_width=True)
+        st.dataframe(corr, width='stretch')
 
     st.subheader("Raw measurements (first 500 rows)")
-    st.dataframe(df.head(500), use_container_width=True)
+    st.dataframe(df.head(500), width='stretch')
 
     # Downloads (tables)
     st.download_button(
@@ -858,7 +875,7 @@ def streamlit_app() -> None:
             col = summary_cols[0]
             hist_png = plot_histogram_and_box_bytes(df, col, bins=60)
             if hist_png:
-                st.image(hist_png, use_container_width=True)
+                st.image(hist_png, width='stretch')
                 st.download_button(
                     "Download histogram PNG",
                     hist_png,
@@ -870,7 +887,7 @@ def streamlit_app() -> None:
             sk = skel if show_skeleton else None
             overlay_img = make_edge_overlay(rgb, tissue_mask, sk)
             st.subheader("Edge overlay (edges green; skeleton red if enabled)")
-            st.image(overlay_img, use_container_width=True)
+            st.image(overlay_img, width='stretch')
             _, buf = cv2.imencode(".png", cv2.cvtColor(overlay_img, cv2.COLOR_RGB2BGR))
             overlay_png = buf.tobytes()
             st.download_button(
@@ -885,7 +902,7 @@ def streamlit_app() -> None:
             heat_overlay = overlay_heatmap_on_rgb(rgb, heat_rgb, alpha=float(heat_alpha))
 
             st.subheader("Thickness heatmap overlay")
-            st.image(heat_overlay, use_container_width=True)
+            st.image(heat_overlay, width='stretch')
 
             _, bufh = cv2.imencode(".png", cv2.cvtColor(heat_overlay, cv2.COLOR_RGB2BGR))
             heat_overlay_png = bufh.tobytes()
@@ -909,7 +926,7 @@ def streamlit_app() -> None:
             st.subheader("Masks")
             mask_img = (tissue_mask.astype(np.uint8) * 255)
             st.write("Tissue mask")
-            st.image(mask_img, use_container_width=True)
+            st.image(mask_img, width='stretch')
             _, bufm = cv2.imencode(".png", mask_img)
             mask_png = bufm.tobytes()
             st.download_button(
@@ -922,7 +939,7 @@ def streamlit_app() -> None:
             if params["generate_skeleton"]:
                 skel_img = (skel.astype(np.uint8) * 255)
                 st.write("Skeleton")
-                st.image(skel_img, use_container_width=True)
+                st.image(skel_img, width='stretch')
                 _, bufs = cv2.imencode(".png", skel_img)
                 skel_png = bufs.tobytes()
                 st.download_button(
@@ -959,7 +976,7 @@ def streamlit_app() -> None:
                     preview_img = rgb.copy()
                     preview_img[markers_vis] = [255, 0, 0]
                     st.subheader("Marker preview (red = watershed seeds)")
-                    st.image(preview_img, use_container_width=True)
+                    st.image(preview_img, width='stretch')
                     st.caption(f"Markers detected: {int(np.max(markers_img))}")
                 except Exception:
                     pass
@@ -978,7 +995,7 @@ def streamlit_app() -> None:
             )
             st.subheader("Coloured alveoli overlay")
             st.write(f"Identified alveoli: **{n_alv}**")
-            st.image(colored, use_container_width=True)
+            st.image(colored, width='stretch')
             _, buf = cv2.imencode(".png", cv2.cvtColor(colored, cv2.COLOR_RGB2BGR))
             alveoli_png = buf.tobytes()
             st.download_button(
