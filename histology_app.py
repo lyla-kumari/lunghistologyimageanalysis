@@ -46,9 +46,7 @@ from skimage.feature import peak_local_max
 from skimage.segmentation import watershed
 
 
-# =========================
 # IO helpers
-# =========================
 
 def read_rgb_image(path: Path) -> np.ndarray:
     img = Image.open(str(path)).convert("RGB")
@@ -98,9 +96,7 @@ def save_binary_png(mask: np.ndarray, out_path: Path) -> None:
     cv2.imwrite(str(out_path), img)
 
 
-# =========================
 # Segmentation
-# =========================
 
 def inpaint_specular(rgb: np.ndarray, val_quantile: float = 0.995, dilate_radius: int = 5) -> np.ndarray:
     """Detect very bright regions (specular highlights) and inpaint them."""
@@ -236,9 +232,7 @@ def tissue_mask_advanced(
     return combined.astype(bool)
 
 
-# =========================
 # Measurement
-# =========================
 
 def measure_airspaces_and_wall_thickness(
     tissue_mask: np.ndarray,
@@ -353,9 +347,7 @@ def measure_airspaces_and_wall_thickness(
     return df, tissue_mask, skel, thickness_px_map
 
 
-# =========================
 # Statistics
-# =========================
 
 def _finite_series(df: pd.DataFrame, col: str) -> pd.Series:
     if col not in df.columns:
@@ -450,9 +442,7 @@ def corr_table(df: pd.DataFrame, cols: Tuple[str, ...]) -> pd.DataFrame:
     return sub.corr(method="pearson")
 
 
-# =========================
 # Images / overlays
-# =========================
 
 def thickness_map_to_colormap_image(
     thickness_px_map: np.ndarray,
@@ -634,9 +624,7 @@ def plot_histogram_and_box_bytes(df: pd.DataFrame, col: str, bins: int = 60) -> 
     return buf.getvalue()
 
 
-# =========================
 # Streamlit app (privacy maximised)
-# =========================
 
 def streamlit_app() -> None:
     import streamlit as st
@@ -1063,9 +1051,7 @@ def streamlit_app() -> None:
         pass
 
 
-# =========================
 # CLI (privacy maximised)
-# =========================
 
 def detect_microns_from_filename(name: str) -> Optional[float]:
     patterns = [
@@ -1375,9 +1361,7 @@ def cli_main() -> None:
                  tcol, s.size, float(np.median(s)), float(np.quantile(s, 0.05)), float(np.quantile(s, 0.95)))
 
 
-# =========================
 # Entrypoint
-# =========================
 
 if __name__ == "__main__":
     # If streamlit is available and no non-flag args are provided -> run app; otherwise run CLI.
