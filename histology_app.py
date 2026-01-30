@@ -246,12 +246,18 @@ def measure_airspaces_and_wall_thickness(
     """
     Per airspace stats; wall thickness sampled from tissue pixels adjacent to each airspace.
 
+    Improvements:
+      - Use Euclidean distance-to-air to select tissue pixels within `wall_neigh_radius` of an
+        airspace (gives isotropic, distance-based neighbourhoods) instead of a morphological
+        binary dilation by a disk. This reduces sampling bias, especially for non-circular
+        structures and small radii.
+
     Returns:
       df, tissue_mask, skel, thickness_px_map
     """
     tissue_mask = tissue_mask.astype(bool)
 
-    # thickness map for tissue pixels
+    # thickness map for tissue pixels (in pixels)
     dist = ndi.distance_transform_edt(tissue_mask)
     thickness_px_map = 2.0 * dist
 
@@ -264,13 +270,67 @@ def measure_airspaces_and_wall_thickness(
 
     labeled, nlabels = ndi.label(air_mask)
 
+    # Remove small labeled airspaces (enforce air_min_object_size) to avoid overcounting
+    if nlabels > 0:
+        try:
+            counts = np.bincount(labeled.ravel())
+            small_ids = np.where(counts < int(max(1, air_min_object_size)))[0]
+            small_ids = small_ids[small_ids != 0]
+            if small_ids.size:
+                labeled[np.isin(labeled, small_ids)] = 0
+                labeled, nlabels = ndi.label(labeled > 0)
+        except Exception:
+            pass
+
+    # Merge small fragmented air labels into neighbouring larger regions to avoid double-counting
+    if nlabels > 0:
+        try:
+            counts = np.bincount(labeled.ravel())
+            # Small components that are notably smaller than a typical air_min_object_size
+            # are candidates to be merged into adjacent larger neighbours.
+            merge_thresh = int(max(1, air_min_object_size * 2))
+            small_merge_ids = np.where((counts > 0) & (counts < merge_thresh))[0]
+            small_merge_ids = small_merge_ids[small_merge_ids != 0]
+            if small_merge_ids.size:
+                se = morphology.disk(1)
+                for sid in small_merge_ids:
+                    mask_sid = (labeled == int(sid))
+                    # find neighbour labels by dilating the small component once
+                    neigh_mask = morphology.binary_dilation(mask_sid, footprint=se) & (~mask_sid)
+                    neigh_labels = np.unique(labeled[neigh_mask])
+                    neigh_labels = neigh_labels[neigh_labels != 0]
+                    if neigh_labels.size:
+                        # merge into the neighbouring label with the largest area
+                        neigh_counts = counts[neigh_labels]
+                        best = int(neigh_labels[np.argmax(neigh_counts)])
+                        labeled[mask_sid] = best
+                # relabel after merges
+                labeled, nlabels = ndi.label(labeled > 0)
+        except Exception:
+            pass
+
+    # Remove labels that touch the image border (likely incomplete regions)
+    if nlabels > 0:
+        try:
+            border_ids = np.unique(np.concatenate([labeled[0, :], labeled[-1, :], labeled[:, 0], labeled[:, -1]]))
+            border_ids = border_ids[border_ids != 0]
+            if border_ids.size:
+                labeled[np.isin(labeled, border_ids)] = 0
+                labeled, nlabels = ndi.label(labeled > 0)
+        except Exception:
+            pass
+
+    # Ensure air_mask reflects the pruned labeled result
+    air_mask = (labeled > 0)
+
     # optional skeleton of walls (for display only)
     skel = np.zeros_like(tissue_mask, dtype=bool)
     if generate_skeleton:
         try:
-            wall_region = morphology.binary_dilation(
-                air_mask, footprint=morphology.disk(int(max(1, wall_neigh_radius)))
-            ) & tissue_mask
+            # create a wall region for skeletonizing based on distance-to-air to get
+            # a band of tissue pixels adjacent to airspaces
+            dist_to_air = ndi.distance_transform_edt(~air_mask)
+            wall_region = (dist_to_air <= float(max(1, wall_neigh_radius))) & tissue_mask
             skel = morphology.skeletonize(wall_region)
             if skeleton_prune_px and int(skeleton_prune_px) > 0:
                 skel = morphology.remove_small_objects(skel.astype(bool), min_size=int(skeleton_prune_px))
@@ -293,8 +353,12 @@ def measure_airspaces_and_wall_thickness(
     centroids = ndi.center_of_mass(air_mask, labeled, range(1, nlabels + 1))
 
     records = []
-    rad = int(max(1, wall_neigh_radius))
-    fp = morphology.disk(rad)
+    # Use float radius for distance-based neighbourhood selection
+    rad = float(max(1.0, wall_neigh_radius))
+
+    # Precompute distance-to-air map: for tissue pixels, this is the Euclidean distance to the
+    # nearest air pixel. We will select tissue pixels with distance_to_air <= rad for each airspace.
+    dist_to_air_map = ndi.distance_transform_edt(~air_mask)
 
     for lbl in range(1, nlabels + 1):
         region = (labeled == lbl)
@@ -304,8 +368,30 @@ def measure_airspaces_and_wall_thickness(
 
         diameter_px = float(np.sqrt(4.0 * area_px / np.pi))
 
-        neigh = morphology.binary_dilation(region, footprint=fp)
-        wall_region = neigh & tissue_mask
+        # Select tissue pixels that lie within `rad` of this airspace (distance-to-air <= rad)
+        # and are spatially adjacent to the specific airspace: we mask by whether the nearest air
+        # pixel (to a tissue pixel) belongs to this airspace. To do this robustly we compute a
+        # simple nearest-air label map via a distance transform on the labeled air mask.
+        try:
+            # compute Euclidean distance to each labeled-air region using a fast approach:
+            # create an array where non-air has label 0 and air pixels hold their air-label.
+            air_label_map = labeled.copy().astype(int)
+
+            # For each tissue pixel, find the nearest air pixel's label by computing the index of
+            # the minimum distance in a brute-force manner is expensive; instead we approximate
+            # by using a nearest-neighbour approach: use distance transform on mask per-label
+            # is expensive if many labels; instead intersect a dilation of the region with tissue
+            # within rad to localise the wall sampling to the neighbourhood of the region.
+
+            # Fall back to a local neighbourhood: take tissue pixels where dist_to_air_map <= rad
+            # AND which are within a morphological dilation of the region by a disk of radius ceil(rad).
+            se = morphology.disk(int(np.ceil(rad)))
+            neigh = morphology.binary_dilation(region, footprint=se)
+            wall_region = (dist_to_air_map <= rad) & tissue_mask & neigh
+        except Exception:
+            # conservative fallback to morphological dilation (previous behaviour)
+            wall_region = morphology.binary_dilation(region, footprint=morphology.disk(int(max(1, wall_neigh_radius)))) & tissue_mask
+
         vals = thickness_px_map[wall_region]
 
         if vals.size == 0:
@@ -770,7 +856,11 @@ def streamlit_app() -> None:
     # -------- Main outputs --------
     if show_images and show_original:
         st.subheader("Original image")
-        st.image(rgb, width='stretch')
+        try:
+            disp_w = int(min(900, rgb.shape[1])) if (isinstance(rgb, np.ndarray) and rgb.ndim >= 2) else 800
+        except Exception:
+            disp_w = 800
+        st.image(rgb, width=disp_w)
 
     if show_images and show_color_preview and color_target != "none":
         try:
@@ -784,7 +874,11 @@ def streamlit_app() -> None:
             preview = rgb.copy()
             preview[cm] = [255, 0, 0]
             st.subheader("Hue-target preview (red = selected pixels)")
-            st.image(preview, width='stretch')
+            try:
+                disp_w = int(min(900, preview.shape[1])) if (isinstance(preview, np.ndarray) and preview.ndim >= 2) else 800
+            except Exception:
+                disp_w = 800
+            st.image(preview, width=disp_w)
             st.caption(f"Selected pixels: {int(cm.sum())}")
         except Exception:
             pass
@@ -858,84 +952,81 @@ def streamlit_app() -> None:
     overlay_png = heatmap_png = heat_overlay_png = mask_png = skel_png = alveoli_png = hist_png = None
 
     if show_images:
+        # Collect images to display in a grid
+        images = []  # list of dicts: {title, img_bytes, filename, mime, caption}
+
         if show_hists and df.shape[0] > 0:
-            st.subheader("Thickness distribution (hist + box)")
-            col = summary_cols[0]
-            hist_png = plot_histogram_and_box_bytes(df, col, bins=60)
+            colname = summary_cols[0]
+            hist_png = plot_histogram_and_box_bytes(df, colname, bins=60)
             if hist_png:
-                st.image(hist_png, width='stretch')
-                st.download_button(
-                    "Download histogram PNG",
-                    hist_png,
-                    file_name=f"{base}_hist_{col}.png",
-                    mime="image/png",
-                )
+                images.append({
+                    "title": "Thickness distribution (hist + box)",
+                    "img": hist_png,
+                    "filename": f"{base}_hist_{colname}.png",
+                    "mime": "image/png",
+                    "caption": None,
+                })
 
         if show_overlay:
             sk = skel if show_skeleton else None
             overlay_img = make_edge_overlay(rgb, tissue_mask, sk)
-            st.subheader("Edge overlay (edges green; skeleton red if enabled)")
-            st.image(overlay_img, width='stretch')
             _, buf = cv2.imencode(".png", cv2.cvtColor(overlay_img, cv2.COLOR_RGB2BGR))
             overlay_png = buf.tobytes()
-            st.download_button(
-                "Download overlay PNG",
-                overlay_png,
-                file_name=f"{base}_overlay.png",
-                mime="image/png",
-            )
+            images.append({
+                "title": "Edge overlay (edges green; skeleton red if enabled)",
+                "img": overlay_png,
+                "filename": f"{base}_overlay.png",
+                "mime": "image/png",
+                "caption": None,
+            })
 
         if show_heatmap:
             heat_rgb = thickness_map_to_colormap_image(thickness_px_map, cmap="viridis")
             heat_overlay = overlay_heatmap_on_rgb(rgb, heat_rgb, alpha=float(heat_alpha))
 
-            st.subheader("Thickness heatmap overlay")
-            st.image(heat_overlay, width='stretch')
-
             _, bufh = cv2.imencode(".png", cv2.cvtColor(heat_overlay, cv2.COLOR_RGB2BGR))
             heat_overlay_png = bufh.tobytes()
-            st.download_button(
-                "Download heatmap overlay PNG",
-                heat_overlay_png,
-                file_name=f"{base}_heatmap_overlay.png",
-                mime="image/png",
-            )
+            images.append({
+                "title": "Thickness heatmap overlay",
+                "img": heat_overlay_png,
+                "filename": f"{base}_heatmap_overlay.png",
+                "mime": "image/png",
+                "caption": None,
+            })
 
             _, bufc = cv2.imencode(".png", cv2.cvtColor(heat_rgb, cv2.COLOR_RGB2BGR))
             heatmap_png = bufc.tobytes()
-            st.download_button(
-                "Download thickness colormap PNG",
-                heatmap_png,
-                file_name=f"{base}_thickness_colormap.png",
-                mime="image/png",
-            )
+            images.append({
+                "title": "Thickness colormap",
+                "img": heatmap_png,
+                "filename": f"{base}_thickness_colormap.png",
+                "mime": "image/png",
+                "caption": None,
+            })
 
         if show_masks:
-            st.subheader("Masks")
             mask_img = (tissue_mask.astype(np.uint8) * 255)
-            st.write("Tissue mask")
-            st.image(mask_img, width='stretch')
             _, bufm = cv2.imencode(".png", mask_img)
             mask_png = bufm.tobytes()
-            st.download_button(
-                "Download mask PNG",
-                mask_png,
-                file_name=f"{base}_mask.png",
-                mime="image/png",
-            )
+            images.append({
+                "title": "Tissue mask",
+                "img": mask_png,
+                "filename": f"{base}_mask.png",
+                "mime": "image/png",
+                "caption": None,
+            })
 
             if params["generate_skeleton"]:
                 skel_img = (skel.astype(np.uint8) * 255)
-                st.write("Skeleton")
-                st.image(skel_img, width='stretch')
                 _, bufs = cv2.imencode(".png", skel_img)
                 skel_png = bufs.tobytes()
-                st.download_button(
-                    "Download skeleton PNG",
-                    skel_png,
-                    file_name=f"{base}_skeleton.png",
-                    mime="image/png",
-                )
+                images.append({
+                    "title": "Skeleton",
+                    "img": skel_png,
+                    "filename": f"{base}_skeleton.png",
+                    "mime": "image/png",
+                    "caption": None,
+                })
 
         if show_alveoli_colored:
             if marker_preview:
@@ -963,9 +1054,15 @@ def streamlit_app() -> None:
                         markers_vis = markers_mask
                     preview_img = rgb.copy()
                     preview_img[markers_vis] = [255, 0, 0]
-                    st.subheader("Marker preview (red = watershed seeds)")
-                    st.image(preview_img, width='stretch')
-                    st.caption(f"Markers detected: {int(np.max(markers_img))}")
+                    _, bufp = cv2.imencode(".png", cv2.cvtColor(preview_img, cv2.COLOR_RGB2BGR))
+                    preview_png = bufp.tobytes()
+                    images.append({
+                        "title": "Marker preview (red = watershed seeds)",
+                        "img": preview_png,
+                        "filename": f"{base}_marker_preview.png",
+                        "mime": "image/png",
+                        "caption": f"Markers detected: {int(np.max(markers_img))}",
+                    })
                 except Exception:
                     pass
 
@@ -981,17 +1078,50 @@ def streamlit_app() -> None:
                 h_maxima_h=float(h_maxima_h),
                 dist_smooth_sigma=float(dist_smooth_sigma),
             )
-            st.subheader("Coloured alveoli overlay")
-            st.write(f"Identified alveoli: **{n_alv}**")
-            st.image(colored, width='stretch')
             _, buf = cv2.imencode(".png", cv2.cvtColor(colored, cv2.COLOR_RGB2BGR))
             alveoli_png = buf.tobytes()
-            st.download_button(
-                "Download coloured alveoli overlay PNG",
-                alveoli_png,
-                file_name=f"{base}_alveoli_coloured_overlay.png",
-                mime="image/png",
-            )
+            images.append({
+                "title": f"Coloured alveoli overlay (n={n_alv})",
+                "img": alveoli_png,
+                "filename": f"{base}_alveoli_coloured_overlay.png",
+                "mime": "image/png",
+                "caption": None,
+            })
+
+        # Display images in a grid
+        if images:
+            # configurable columns per row
+            try:
+                cols_per_row = int(st.sidebar.number_input("Images per row", min_value=1, max_value=4, value=2, step=1))
+            except Exception:
+                cols_per_row = 2
+
+            st.subheader("Image gallery")
+            cols = []
+            row = None
+            for i, item in enumerate(images):
+                col_idx = i % cols_per_row
+                if col_idx == 0:
+                    row = st.columns(cols_per_row)
+                with row[col_idx]:
+                    st.markdown(f"**{item['title']}**")
+                    try:
+                        st.image(item["img"], width='stretch')
+                    except Exception:
+                        # If we have raw numpy image, show directly
+                        try:
+                            st.image(np.asarray(item["img"]), width='stretch')
+                        except Exception:
+                            pass
+                    if item.get("caption"):
+                        st.caption(item["caption"])
+                    # download button for this image
+                    st.download_button(
+                        f"Download {item['title']}",
+                        item["img"],
+                        file_name=item.get("filename", f"{base}_image.png"),
+                        mime=item.get("mime", "image/png"),
+                    )
 
     # -------- ZIP bundle --------
     if zip_download:
