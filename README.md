@@ -1,43 +1,86 @@
-# Lung Histology — Alveolar airspaces + wall thickness
+# Lung Histology — DEC + Alveolar Batch Counter
 
-This folder contains a copy of the privacy-focused lung histology analysis tool developed for measuring alveolar airspaces and wall thickness.
+This folder contains a Streamlit app for batch quantification of:
+- **DEC** particles (counting + optional particle table)
+- **Alveolar (ALV)** airspace particles using **long** and **short** variants (counts + area summaries)
 
-Features
-- Streamlit app for interactive segmentation and QC
-- CLI for batch processing and exporting anonymized outputs
-- Watershed-based alveoli separation with configurable marker strategies
-- Exports CSV, NPY thickness maps and optional QC images
-- Privacy-first defaults: anonymized outputs, no persistent uploads
+It is designed for **batch processing with QC previews** and **exportable Excel + ZIP bundles**.
 
-Quick start (recommended: create Python virtual environment first)
+## Features
+- Upload **one/more images** (`.tif/.tiff/.jpg/.jpeg/.png`) or a **ZIP** of images
+- Optional **EXIF/metadata stripping** on ingest (recommended)
+- Runs **DEC** + **ALV (long & short)** for each image
+- Heuristic suggestion for whether **long** or **short** segmentation is more plausible
+- Optional **particle tables** (larger outputs, slower)
+- Optional **Fiji/ImageJ headless** execution for ALV counting (macOS)
+- Exports:
+  - `DEC_results.xlsx`
+  - `ALV_results.xlsx`
+  - `dec_alv_outputs_bundle.zip` (Excels + QC overlays + params + errors)
 
-1. Create and activate venv (macOS / Linux):
+## Quick start
 
-   python3 -m venv venv
-   source venv/bin/activate
+### 1) Create + activate a virtual environment (macOS / Linux)
 
-2. Install dependencies:
+```bash
+python3 -m venv venv
+source venv/bin/activate
+```
 
-   pip install -r requirements.txt
+### 2) Install dependencies
 
-3. Run Streamlit app:
+```bash
+pip install -r requirements.txt
+```
 
-   streamlit run testlh.py
+### 3) Run the Streamlit app
 
-4. Run CLI example (outputs saved to `out`):
+```bash
+streamlit run histology_app.py
+```
 
-   python testlh.py path/to/image.png --out_dir out --save_images --alveoli_overlay
+## Inputs
+- Single image(s): `.tif`, `.tiff`, `.jpg`, `.jpeg`, `.png`
+- ZIP file containing any mix of the supported image types
 
-Files
-- `testlh.py`: main privacy-first script (Streamlit + CLI)
-- `requirements.txt`: pinned dependencies
-- `run_cli.sh`: example CLI command
-- `LICENSE`: MIT license
-- `.gitignore`: ignores venv and output folders
+If a ZIP and standalone image(s) contain the same basename, later items override earlier ones.
 
-Notes
-- The app uses scikit-image, OpenCV, NumPy, Pandas, SciPy and Streamlit.
-- Default behaviour anonymizes outputs; pass `--keep_names` to the CLI to preserve filenames.
+## Outputs
 
-Contact
-- For issues or feature requests, add an issue to the repository.
+### Excel outputs
+- `DEC_results.xlsx`
+  - `DEC_counts` (always)
+  - `DEC_particles` (if enabled)
+  - `errors` (if any)
+- `ALV_results.xlsx`
+  - `ALV_counts` (always)
+  - `ALV_particles` (if enabled)
+  - `errors` (if any)
+
+### Bundle output
+- `dec_alv_outputs_bundle.zip`
+  - `DEC_results.xlsx`, `ALV_results.xlsx`
+  - `params.json` (run configuration)
+  - `errors.csv` (if any)
+  - `qc/` overlays for a subset of samples:
+    - `{sample_id}_original.jpg`
+    - `{sample_id}_dec.jpg`
+    - `{sample_id}_alv_long.jpg`
+    - `{sample_id}_alv_short.jpg`
+
+## Fiji/ImageJ (optional)
+ALV counting can be delegated to Fiji/ImageJ in **headless** mode.
+
+- macOS default locations are probed automatically
+- or provide the executable path in the sidebar (e.g. `/Applications/Fiji.app/ImageJ-macosx`)
+
+Even when Fiji is used for ALV counts/areas, the app still generates **Python-based QC overlays** for consistency.
+
+## Files
+- `histology_app.py`: Streamlit app (DEC + ALV batch counter)
+- `requirements.txt`: Python dependencies
+- `LICENSE`: project license (if present)
+
+## Notes
+- Calibration (µm/px) is optional. If provided, ALV mean size and surface area are also reported in **mm²**.
+- Outputs use the **original filenames** as `sample_id` (no anonymisation step in this app).
