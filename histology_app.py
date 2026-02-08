@@ -661,11 +661,33 @@ with st.sidebar:
     qc_preview_n = st.slider("QC preview count", 0, 30, 12, 1)
     qc_jpeg_quality = st.slider("QC JPEG quality", 50, 95, 85, 5)
 
-    st.header("3b) ImageJ/Fiji (optional, ALV only)")
-    use_fiji_for_alv = st.checkbox("Use Fiji/ImageJ macros for ALV (headless)", value=False)
+    st.header("3b) ALV backend")
+    alv_backend = st.selectbox(
+        "ALV analysis backend",
+        options=["Python (built-in)", "Fiji/ImageJ (headless)"],
+        index=0,
+        help=(
+            "Python mode is the default and produces overlays + counts/areas in one pipeline. "
+            "Fiji/ImageJ mode runs headless Analyze Particles for counts/areas; overlays still come from Python."
+        ),
+    )
+
+    use_fiji_for_alv = alv_backend.startswith("Fiji")
+
+    fiji_exe_upload = st.file_uploader(
+        "Select Fiji executable (optional)",
+        type=["exe"],
+        accept_multiple_files=False,
+        disabled=not use_fiji_for_alv,
+        help=(
+            "Optional: on Windows, you can upload/select ImageJ-win64.exe. "
+            "If you don't upload, the app will try default install locations or the manual path below."
+        ),
+    )
     fiji_path = st.text_input(
-        "Fiji executable path",
+        "Or enter Fiji executable path",
         value="",
+        disabled=not use_fiji_for_alv,
         help=(
             "Examples: "
             "macOS: /Applications/Fiji.app/ImageJ-macosx | "
@@ -751,11 +773,30 @@ run_params = {
 # Resolve Fiji executable once
 fiji_exe = None
 if use_fiji_for_alv:
-    fiji_exe = _find_fiji_executable(fiji_path)
+    # If the user selected an exe via file-uploader, persist to a temp file.
+    if fiji_exe_upload is not None:
+        try:
+            suffix = ".exe" if str(getattr(fiji_exe_upload, "name", "")).lower().endswith(".exe") else ""
+            fd, tmp_path = tempfile.mkstemp(prefix="fiji_exe_", suffix=suffix)
+            os.close(fd)
+            Path(tmp_path).write_bytes(fiji_exe_upload.getvalue())
+            # Mark executable (best-effort). On Windows this is not required.
+            try:
+                os.chmod(tmp_path, 0o755)
+            except Exception:
+                pass
+            fiji_exe = tmp_path
+        except Exception as e:
+            st.error(f"Could not use uploaded Fiji executable: {e}")
+            st.stop()
+    else:
+        fiji_exe = _find_fiji_executable(fiji_path)
+
     if not fiji_exe:
         st.error(
             "Fiji/ImageJ not found or not executable. "
-            "Install Fiji and set the path to 'ImageJ-macosx' (macOS), e.g. /Applications/Fiji.app/ImageJ-macosx."
+            "Install Fiji and set the executable path. "
+            "Examples: macOS /Applications/Fiji.app/ImageJ-macosx | Windows C:/Fiji.app/ImageJ-win64.exe"
         )
         st.stop()
 
