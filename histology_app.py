@@ -492,8 +492,16 @@ def suggest_variant(n_long: int, n_short: int) -> str:
 # Fiji/ImageJ integration (optional)
 # -----------------------------
 FIJI_DEFAULTS = [
+    # macOS
     "/Applications/Fiji.app/ImageJ-macosx",
     "/Applications/Fiji.app/Contents/MacOS/ImageJ-macosx",
+    # Linux (common install locations)
+    "/opt/Fiji.app/ImageJ-linux64",
+    "/usr/local/Fiji.app/ImageJ-linux64",
+    # Windows (common install locations)
+    "C:/Fiji.app/ImageJ-win64.exe",
+    "C:/Program Files/Fiji.app/ImageJ-win64.exe",
+    "C:/Program Files (x86)/Fiji.app/ImageJ-win64.exe",
 ]
 
 
@@ -656,9 +664,13 @@ with st.sidebar:
     st.header("3b) ImageJ/Fiji (optional, ALV only)")
     use_fiji_for_alv = st.checkbox("Use Fiji/ImageJ macros for ALV (headless)", value=False)
     fiji_path = st.text_input(
-        "Fiji executable path (ImageJ-macosx)",
+        "Fiji executable path",
         value="",
-        help="Example macOS: /Applications/Fiji.app/ImageJ-macosx",
+        help=(
+            "Examples: "
+            "macOS: /Applications/Fiji.app/ImageJ-macosx | "
+            "Windows: C:/Fiji.app/ImageJ-win64.exe"
+        ),
     )
 
     st.header("4) DEC parameters")
