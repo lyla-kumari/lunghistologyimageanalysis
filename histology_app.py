@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-DEC + Alveolar Batch Counter — FULL REWRITE (same outputs)
+DEC + Alveolar Batch Counter — FULL REWRITE (same visuals, protocol-aligned ALV)
 
 Streamlit:
   streamlit run dec_alv_app.py
 
-Outputs (same as your current app):
+Outputs (same filenames + bundle structure):
 - DEC_results.xlsx (sheet: DEC_counts; + DEC_particles if enabled; + errors if any)
 - ALV_results.xlsx (sheet: ALV_counts; + ALV_particles if enabled; + errors if any)
 - dec_alv_outputs_bundle.zip
@@ -13,9 +13,17 @@ Outputs (same as your current app):
   - errors.csv (if any)
   - qc/{sample_id}_original.jpg, {sample_id}_dec.jpg, {sample_id}_alv_long.jpg, {sample_id}_alv_short.jpg
 
-Notes:
-- Image-processing logic is preserved as close as possible to your current app.
-- Fiji/ImageJ headless option for ALV produces counts/areas using Analyze Particles and writes Results CSV (no Excel plugin).
+Key changes to match the ImageJ macro intention for ALV:
+- Implements ImageJ "Analyze Particles ... exclude" (drops particles touching border).
+- Measures Perimeter (and derived mean/SD/CV) as protocol-first metrics.
+- Keeps long vs short preprocessing to mimic macros:
+  - long: Close- then Invert
+  - short: no Close-/Invert
+- Still computes area fields for traceability (px + frac + optional mm²).
+
+Notes on Fiji/ImageJ headless:
+- This mode runs headless Analyze Particles and parses Area + Perimeter from the Results CSV.
+- Overlays are still produced by the Python pipeline for consistent QC images in the bundle.
 """
 
 import io
@@ -24,7 +32,6 @@ import os
 import re
 import subprocess
 import tempfile
-import uuid
 import zipfile
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -228,7 +235,7 @@ def make_bundle_zip(
 
 
 # -----------------------------
-# Image processing primitives (same family)
+# Image processing primitives (family similar to ImageJ pipeline)
 # -----------------------------
 def rolling_ball_background_subtract(gray8: np.ndarray, radius: int = 50) -> np.ndarray:
     k = max(3, int(radius) | 1)
@@ -303,7 +310,7 @@ def safe_mode_intensity(values: np.ndarray) -> float:
 
 
 # -----------------------------
-# DEC pipeline (same outputs)
+# DEC pipeline (same outputs schema)
 # -----------------------------
 @dataclass(frozen=True)
 class DECParams:
@@ -324,7 +331,21 @@ def region_props_from_binary(mask01: np.ndarray, gray_original: np.ndarray) -> p
     rows = []
     for p in props:
         area = float(p.area)
-        mean_int = float(p.mean_intensity) if p.mean_intensity is not None else np.nan
+
+        def _rp_get(pp, new_name, old_name):
+            v = getattr(pp, new_name, None)
+            if v is None:
+                v = getattr(pp, old_name, None)
+            return v
+
+        mean_int = _rp_get(p, "intensity_mean", "mean_intensity")
+        mean_int = float(mean_int) if mean_int is not None else np.nan
+
+        maj = _rp_get(p, "axis_major_length", "major_axis_length")
+        maj = float(maj) if maj else np.nan
+
+        mino = _rp_get(p, "axis_minor_length", "minor_axis_length")
+        mino = float(mino) if mino else np.nan
 
         coords = p.coords
         pix = gray_original[coords[:, 0], coords[:, 1]]
@@ -333,8 +354,6 @@ def region_props_from_binary(mask01: np.ndarray, gray_original: np.ndarray) -> p
         perim = float(p.perimeter) if p.perimeter and p.perimeter > 0 else np.nan
         circularity = (4 * np.pi * area / (perim ** 2)) if (perim and perim > 0) else np.nan
 
-        maj = float(p.major_axis_length) if p.major_axis_length else np.nan
-        mino = float(p.minor_axis_length) if p.minor_axis_length else np.nan
         ar = (maj / mino) if (maj and mino and mino > 0) else np.nan
         roundness = (4 * area / (np.pi * (maj ** 2))) if (maj and maj > 0) else np.nan
 
@@ -382,7 +401,12 @@ def run_dec_pipeline(bgr: np.ndarray, params: DECParams) -> Tuple[pd.DataFrame, 
     edges = find_edges(gray)
     mask01 = threshold_mask_like_inter(edges)
 
-    mask01 = morphology.remove_small_objects(mask01.astype(bool), min_size=params.min_object_pixels).astype(np.uint8)
+    # Remove tiny components (fix: use min_size, not max_size)
+    mask01 = morphology.remove_small_objects(
+        mask01.astype(bool),
+        min_size=int(params.min_object_pixels),
+        connectivity=2,
+    ).astype(np.uint8)
 
     particles_all = region_props_from_binary(mask01, original)
     particles_kept = apply_particle_filters(
@@ -409,7 +433,7 @@ def run_dec_pipeline(bgr: np.ndarray, params: DECParams) -> Tuple[pd.DataFrame, 
 
 
 # -----------------------------
-# ALV pipeline (Python)
+# ALV pipeline (protocol-aligned: perimeter + exclude edges)
 # -----------------------------
 @dataclass(frozen=True)
 class ALVParams:
@@ -421,16 +445,47 @@ class ALVParams:
     min_area: float = 100
 
 
-def analyze_particles_binary(mask01: np.ndarray) -> Tuple[pd.DataFrame, np.ndarray]:
+def analyze_particles_binary(mask01: np.ndarray, exclude_edges: bool = True) -> Tuple[pd.DataFrame, np.ndarray]:
+    """
+    Mimic ImageJ Analyze Particles:
+    - Connected components
+    - Measure area + perimeter
+    - 'exclude' => drop objects that touch the image border
+    """
+    mask01 = (mask01 > 0).astype(np.uint8)
+    h, w = mask01.shape[:2]
+
     labeled = measure.label(mask01, connectivity=2)
     props = measure.regionprops(labeled)
-    rows = [{"label": int(p.label), "area": float(p.area)} for p in props]
+
+    rows = []
+    for p in props:
+        if exclude_edges:
+            minr, minc, maxr, maxc = p.bbox  # max* are exclusive
+            touches = (minr == 0) or (minc == 0) or (maxr == h) or (maxc == w)
+            if touches:
+                continue
+
+        rows.append(
+            {
+                "label": int(p.label),
+                "area": float(p.area),
+                "perimeter": float(p.perimeter) if p.perimeter is not None else float("nan"),
+            }
+        )
+
     return pd.DataFrame(rows), labeled
 
 
 def run_alv_pipeline(
     bgr: np.ndarray, params: ALVParams, variant: str
 ) -> Tuple[pd.DataFrame, pd.DataFrame, np.ndarray, np.ndarray]:
+    """
+    Mirrors the macro order:
+    Subtract Background -> Sharpen -> Enhance Contrast -> Find Edges -> Gaussian Blur -> Make Binary
+    long: Close- then Invert
+    short: no Close-/Invert
+    """
     gray = bgr_to_gray8(bgr)
 
     proc = rolling_ball_background_subtract(gray, radius=params.rolling)
@@ -440,15 +495,18 @@ def run_alv_pipeline(
     proc = cv2.GaussianBlur(proc, (0, 0), float(params.blur_sigma))
 
     mask01 = make_binary(proc)
-    mask01 = close_morph(mask01, k=3)
 
     if (variant or "").lower() == "long":
-        # mimic "Invert" pathway
-        mask01 = (1 - mask01).astype(np.uint8)
+        # Macro does Close- then Invert
         mask01 = close_morph(mask01, k=3)
+        mask01 = (1 - mask01).astype(np.uint8)
 
-    particles_all, labeled = analyze_particles_binary(mask01)
-    particles_kept = particles_all[particles_all["area"] >= params.min_area].reset_index(drop=True)
+    # Measure like ImageJ: exclude edges
+    particles_all, labeled = analyze_particles_binary(mask01, exclude_edges=True)
+
+    # Macro filters on size=100-Infinity pixel
+    particles_kept = particles_all.copy()
+    particles_kept = particles_kept[particles_kept["area"] >= params.min_area].reset_index(drop=True)
 
     kept_mask = np.zeros_like(mask01, dtype=np.uint8)
     if not particles_kept.empty:
@@ -461,20 +519,50 @@ def run_alv_pipeline(
     return particles_all, particles_kept, mask01, overlay
 
 
-def summarize_alv(particles_kept: pd.DataFrame) -> Tuple[float, float]:
-    """Return (mean_area_px, sum_area_px) from kept alveolar particles."""
-    if particles_kept is None or particles_kept.empty or "area" not in particles_kept.columns:
-        return float("nan"), float("nan")
+def summarize_alv(particles_kept: pd.DataFrame) -> Dict[str, float]:
+    """
+    Protocol intention:
+    - n alveoli
+    - perimeter mean, SD, CV, sum
+    Also keep area mean + sum for traceability.
+    """
+    if particles_kept is None or particles_kept.empty:
+        return {
+            "n": 0,
+            "perim_mean": float("nan"),
+            "perim_sd": float("nan"),
+            "perim_cv": float("nan"),
+            "perim_sum": 0.0,
+            "area_mean": float("nan"),
+            "area_sum": 0.0,
+        }
 
-    areas = pd.to_numeric(particles_kept["area"], errors="coerce").dropna()
-    if areas.empty:
-        return float("nan"), float("nan")
+    per = pd.to_numeric(particles_kept.get("perimeter"), errors="coerce").dropna()
+    area = pd.to_numeric(particles_kept.get("area"), errors="coerce").dropna()
 
-    return float(areas.mean()), float(areas.sum())
+    n = int(len(particles_kept))
+
+    per_mean = float(per.mean()) if not per.empty else float("nan")
+    per_sd = float(per.std(ddof=1)) if per.shape[0] >= 2 else float("nan")
+    per_cv = float(per_sd / per_mean) if (np.isfinite(per_sd) and np.isfinite(per_mean) and per_mean != 0) else float("nan")
+    per_sum = float(per.sum()) if not per.empty else 0.0
+
+    area_mean = float(area.mean()) if not area.empty else float("nan")
+    area_sum = float(area.sum()) if not area.empty else 0.0
+
+    return {
+        "n": n,
+        "perim_mean": per_mean,
+        "perim_sd": per_sd,
+        "perim_cv": per_cv,
+        "perim_sum": per_sum,
+        "area_mean": area_mean,
+        "area_sum": area_sum,
+    }
 
 
 def suggest_variant(n_long: int, n_short: int) -> str:
-    # Keep original heuristic, with safe guard for complete failure
+    # Keep original heuristic + protocol note: wrong format often <20
     if n_long == 0 and n_short > 0:
         return "short"
     if n_short == 0 and n_long > 0:
@@ -495,10 +583,10 @@ FIJI_DEFAULTS = [
     # macOS
     "/Applications/Fiji.app/ImageJ-macosx",
     "/Applications/Fiji.app/Contents/MacOS/ImageJ-macosx",
-    # Linux (common install locations)
+    # Linux
     "/opt/Fiji.app/ImageJ-linux64",
     "/usr/local/Fiji.app/ImageJ-linux64",
-    # Windows (common install locations)
+    # Windows
     "C:/Fiji.app/ImageJ-win64.exe",
     "C:/Program Files/Fiji.app/ImageJ-win64.exe",
     "C:/Program Files (x86)/Fiji.app/ImageJ-win64.exe",
@@ -508,7 +596,6 @@ FIJI_DEFAULTS = [
 def _is_executable_file(p: Path) -> bool:
     if not p.exists() or not p.is_file():
         return False
-    # On Windows, the executable bit isn't meaningful.
     if os.name == "nt":
         return p.suffix.lower() in {".exe", ".bat", ".cmd"}
     return os.access(str(p), os.X_OK)
@@ -529,6 +616,15 @@ def _find_fiji_executable(user_path: str) -> Optional[str]:
     return None
 
 
+def _pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    cols = {c.lower(): c for c in df.columns}
+    for cand in candidates:
+        key = cand.lower()
+        if key in cols:
+            return cols[key]
+    return None
+
+
 def run_fiji_alv_macro(
     fiji_exe: str,
     img_bytes: bytes,
@@ -538,15 +634,13 @@ def run_fiji_alv_macro(
     blur_sigma: float,
     min_area: float,
     scale_distance: int = 1104,
-) -> Tuple[int, float, float]:
+) -> Dict[str, float]:
     """
     Run Fiji headless using a generated macro (long/short), parse Results CSV.
 
-    Returns: (count, mean_area_px, sum_area_px)
-
-    Notes:
-    - Uses Analyze Particles with size=min_area-Infinity pixel and exclude edges.
-    - Saves Results as CSV (no Excel plugin required).
+    Returns dict with:
+      - n, area_mean, area_sum
+      - perim_mean, perim_sd, perim_cv, perim_sum
     """
     variant_l = (variant or "").strip().lower()
     if variant_l not in {"long", "short"}:
@@ -555,13 +649,11 @@ def run_fiji_alv_macro(
     macro_template = r"""
     // Expect args like: img=/path/to.png,out=/path/to.csv,rolling=50,sat=20,sigma=2,min_area=100,variant=long,scale_dist=1104
     function getArg(args, key) {
-        // returns value string or ""
         items = split(args, ",");
         for (i=0; i<items.length; i++) {
             kv = split(items[i], "=");
             if (kv.length >= 2) {
                 k = trim(kv[0]);
-                // re-join value in case it contains '='
                 v = kv[1];
                 if (kv.length > 2) {
                     for (j=2; j<kv.length; j++) v = v + "=" + kv[j];
@@ -584,7 +676,6 @@ def run_fiji_alv_macro(
 
     open(img);
 
-    // Set Scale (your existing choice)
     run("Set Scale...", "distance="+scale_dist+" known=1 pixel=1 unit=mm global");
 
     run("Subtract Background...", "rolling="+rolling+" light");
@@ -601,17 +692,16 @@ def run_fiji_alv_macro(
     }
 
     run("Set Measurements...", "area perimeter display redirect=None decimal=3");
-    run("Analyze Particles...", "size="+min_area+"-Infinity pixel exclude clear");
+    run("Analyze Particles...", "size="+min_area+"-Infinity pixel display exclude clear");
 
-    // Save Results table as CSV
     saveAs("Results", out);
     run("Close All");
     """
 
-
     def ij_arg_escape(p: str) -> str:
-        # Fiji args are a single string; normalize separators
-        return str(p).replace("\\", "/")
+        s = str(p).replace("\\", "/")
+        s = s.replace("'", "\\'")
+        return s
 
     with tempfile.TemporaryDirectory(prefix="alv_fiji_") as td:
         td_path = Path(td)
@@ -619,13 +709,12 @@ def run_fiji_alv_macro(
         macro_path = td_path / "alv_headless.ijm"
         results_csv = td_path / f"Results_{variant_l}.csv"
 
-        # Always convert to PNG in-memory to mimic 'Stack to RGB' / format normalization.
         img_path.write_bytes(remove_exif_bytes(img_bytes))
         macro_path.write_text(macro_template, encoding="utf-8")
 
         arg_str = (
-            f"img={ij_arg_escape(img_path)},"
-            f"out={ij_arg_escape(results_csv)},"
+            f"img='{ij_arg_escape(img_path)}',"
+            f"out='{ij_arg_escape(results_csv)}',"
             f"rolling={int(rolling)},"
             f"sat={float(saturated)},"
             f"sigma={float(blur_sigma)},"
@@ -634,7 +723,8 @@ def run_fiji_alv_macro(
             f"scale_dist={int(scale_distance)}"
         )
 
-        cmd = [fiji_exe, "--headless", "--run", str(macro_path), arg_str]
+        cmd = [fiji_exe, "--ij2", "--headless", "--run", str(macro_path), arg_str]
+
         proc = subprocess.run(
             cmd,
             stdout=subprocess.PIPE,
@@ -656,18 +746,46 @@ def run_fiji_alv_macro(
             )
 
         df = pd.read_csv(results_csv)
-        if df.empty or "Area" not in df.columns:
-            return 0, float("nan"), 0.0
+        if df.empty:
+            return {
+                "n": 0,
+                "area_mean": float("nan"),
+                "area_sum": 0.0,
+                "perim_mean": float("nan"),
+                "perim_sd": float("nan"),
+                "perim_cv": float("nan"),
+                "perim_sum": 0.0,
+            }
 
-        areas = pd.to_numeric(df["Area"], errors="coerce").dropna()
-        if areas.empty:
-            return 0, float("nan"), 0.0
+        area_col = _pick_col(df, ["Area"])
+        perim_col = _pick_col(df, ["Perim.", "Perim", "Perimeter"])
 
-        return int(areas.shape[0]), float(areas.mean()), float(areas.sum())
+        areas = pd.to_numeric(df[area_col], errors="coerce").dropna() if area_col else pd.Series([], dtype=float)
+        perims = pd.to_numeric(df[perim_col], errors="coerce").dropna() if perim_col else pd.Series([], dtype=float)
+
+        n = int(max(len(areas), len(perims), 0))
+
+        area_mean = float(areas.mean()) if len(areas) else float("nan")
+        area_sum = float(areas.sum()) if len(areas) else 0.0
+
+        perim_mean = float(perims.mean()) if len(perims) else float("nan")
+        perim_sd = float(perims.std(ddof=1)) if len(perims) >= 2 else float("nan")
+        perim_cv = float(perim_sd / perim_mean) if (np.isfinite(perim_sd) and np.isfinite(perim_mean) and perim_mean != 0) else float("nan")
+        perim_sum = float(perims.sum()) if len(perims) else 0.0
+
+        return {
+            "n": n,
+            "area_mean": area_mean,
+            "area_sum": area_sum,
+            "perim_mean": perim_mean,
+            "perim_sd": perim_sd,
+            "perim_cv": perim_cv,
+            "perim_sum": perim_sum,
+        }
 
 
 # -----------------------------
-# Streamlit App
+# Streamlit App (visuals preserved)
 # -----------------------------
 st.set_page_config(page_title="DEC + Alveolar Batch Counter", layout="wide")
 st.title("DEC + Alveolar Batch Counter")
@@ -694,21 +812,22 @@ with st.sidebar:
         options=["Python (built-in)", "Fiji/ImageJ (headless)"],
         index=0,
         help=(
-            "Python mode is the default and produces overlays + counts/areas in one pipeline. "
-            "Fiji/ImageJ mode runs headless Analyze Particles for counts/areas; overlays still come from Python."
+            "Python mode is the default and produces overlays + counts/metrics in one pipeline. "
+            "Fiji/ImageJ mode runs headless Analyze Particles for counts/area/perimeter; overlays still come from Python."
         ),
     )
 
     use_fiji_for_alv = alv_backend.startswith("Fiji")
 
+    # Keep visuals intact; accept user path. (We intentionally avoid executing an uploaded binary for safety.)
     fiji_exe_upload = st.file_uploader(
         "Select Fiji executable (optional)",
         type=["exe", "bat", "cmd"],
         accept_multiple_files=False,
-        disabled=not use_fiji_for_alv,
+        disabled=True,  # disabled for safety; use the path field below
         help=(
-            "Windows: select ImageJ-win64.exe (or a .bat/.cmd launcher). "
-            "If you don't upload, the app will try default install locations or the manual path below."
+            "Disabled for safety (do not execute uploaded binaries on the host). "
+            "Use the manual path field below to point to an installed Fiji/ImageJ executable."
         ),
     )
     fiji_path = st.text_input(
@@ -741,7 +860,7 @@ with st.sidebar:
     st.caption("Use this if you want surface area in mm² (e.g., fixed 20x setup).")
     um_per_px = st.number_input("Microns per pixel (µm/px)", min_value=0.0, max_value=100.0, value=0.0, step=0.01)
 
-    run_btn = st.button("Run batch analysis", type="primary", width="stretch")
+    run_btn = st.button("Run batch analysis", type="primary", use_container_width=True)
 
 if upload is None:
     st.info("Upload one/more images or a ZIP to begin.")
@@ -787,9 +906,7 @@ alv_params = ALVParams(
 )
 
 run_params = {
-    "privacy": {
-        "strip_exif": strip_exif,
-    },
+    "privacy": {"strip_exif": strip_exif},
     "DECParams": asdict(dec_params),
     "ALVParams": asdict(alv_params),
     "include_particle_tables": include_particle_tables,
@@ -800,41 +917,7 @@ run_params = {
 # Resolve Fiji executable once
 fiji_exe = None
 if use_fiji_for_alv:
-    # Guard: Streamlit Cloud typically runs on Linux. A Windows .exe cannot be executed there.
-    up_name = str(getattr(fiji_exe_upload, "name", "")) if fiji_exe_upload is not None else ""
-    up_suffix = Path(up_name).suffix.lower() if up_name else ""
-    if os.name != "nt" and up_suffix == ".exe":
-        st.error(
-            "You selected a Windows Fiji executable (.exe), but this app is running on a non-Windows host (likely Linux/Streamlit Cloud).\n\n"
-            "This causes: [Errno 8] Exec format error.\n\n"
-            "Fix: switch **ALV analysis backend** to **Python (built-in)**, or run this app on Windows with Fiji installed, "
-            "or install Fiji for Linux and point to the Linux executable (e.g., ImageJ-linux64)."
-        )
-        st.stop()
-
-    # Preferred: user provides a path to an installed Fiji.
     fiji_exe = _find_fiji_executable(fiji_path) if fiji_path else None
-
-    # Optional: user uploads a launcher (primarily useful on Windows local runs)
-    # NOTE: this runs the uploaded binary on the server hosting Streamlit.
-    if fiji_exe is None and fiji_exe_upload is not None:
-        try:
-            up_name = str(getattr(fiji_exe_upload, "name", ""))
-            suffix = Path(up_name).suffix
-            fd, tmp_path = tempfile.mkstemp(prefix="fiji_exe_", suffix=suffix)
-            os.close(fd)
-            Path(tmp_path).write_bytes(fiji_exe_upload.getvalue())
-            try:
-                os.chmod(tmp_path, 0o755)
-            except Exception:
-                pass
-            if _is_executable_file(Path(tmp_path)):
-                fiji_exe = tmp_path
-        except Exception as e:
-            st.error(f"Could not use uploaded Fiji executable: {e}")
-            st.stop()
-
-    # Fallback: probe common install locations
     if fiji_exe is None:
         fiji_exe = _find_fiji_executable("")
 
@@ -845,6 +928,16 @@ if use_fiji_for_alv:
             "- Ensure Fiji is installed on the machine running this Streamlit app\n"
             "- Set the executable path (macOS: /Applications/Fiji.app/ImageJ-macosx | Windows: C:/Fiji.app/ImageJ-win64.exe)\n"
             "- If running on Streamlit Cloud/Linux, a Windows .exe will not work; use the Python backend instead"
+        )
+        st.stop()
+
+    # Guard: Streamlit Cloud typically runs on Linux. A Windows .exe cannot be executed there.
+    if os.name != "nt" and str(fiji_exe).lower().endswith(".exe"):
+        st.error(
+            "You pointed to a Windows Fiji executable (.exe), but this app is running on a non-Windows host.\n\n"
+            "This causes: [Errno 8] Exec format error.\n\n"
+            "Fix: switch **ALV analysis backend** to **Python (built-in)**, or run this app on Windows with Fiji installed, "
+            "or install Fiji for Linux and point to the Linux executable (e.g., ImageJ-linux64)."
         )
         st.stop()
 
@@ -884,13 +977,17 @@ for i, (orig_name, sid) in enumerate(zip(orig_names, sample_ids)):
             dec_particles_rows.append(tmp)
 
         # ---- ALV (Long/Short) ----
-        # Always compute Python overlays for QC (fast enough, and keeps your bundle structure consistent).
-        # If particle tables are enabled and Fiji isn't used, we reuse Python particles tables.
+        # Always compute Python overlays for QC and (if needed) particle tables.
         alv_all_long, alv_kept_long, _, alv_overlay_long = run_alv_pipeline(bgr, alv_params, "long")
         alv_all_short, alv_kept_short, _, alv_overlay_short = run_alv_pipeline(bgr, alv_params, "short")
 
+        # Summaries from Python (protocol-aligned)
+        s_long_py = summarize_alv(alv_kept_long)
+        s_short_py = summarize_alv(alv_kept_short)
+
+        # If Fiji is used, replace n/area/perimeter stats with Fiji's results
         if use_fiji_for_alv and fiji_exe:
-            n_long, mean_long_px, sa_long_px = run_fiji_alv_macro(
+            s_long = run_fiji_alv_macro(
                 fiji_exe=fiji_exe,
                 img_bytes=image_bytes[orig_name],
                 variant="long",
@@ -900,7 +997,7 @@ for i, (orig_name, sid) in enumerate(zip(orig_names, sample_ids)):
                 min_area=float(alv_min_area),
                 scale_distance=1104,
             )
-            n_short, mean_short_px, sa_short_px = run_fiji_alv_macro(
+            s_short = run_fiji_alv_macro(
                 fiji_exe=fiji_exe,
                 img_bytes=image_bytes[orig_name],
                 variant="short",
@@ -911,26 +1008,30 @@ for i, (orig_name, sid) in enumerate(zip(orig_names, sample_ids)):
                 scale_distance=1104,
             )
         else:
-            n_long = int(len(alv_kept_long))
-            n_short = int(len(alv_kept_short))
-            mean_long_px, sa_long_px = summarize_alv(alv_kept_long)
-            mean_short_px, sa_short_px = summarize_alv(alv_kept_short)
+            s_long = s_long_py
+            s_short = s_short_py
 
-        suggestion = suggest_variant(int(n_long), int(n_short))
+        n_long = int(s_long["n"])
+        n_short = int(s_short["n"])
+        suggestion = suggest_variant(n_long, n_short)
 
         # Choose "used" like your current behaviour: short only if suggested == short; else long
-        if suggestion == "short":
-            n_used = int(n_short)
-            mean_used_px, sa_used_px = mean_short_px, sa_short_px
-        else:
-            n_used = int(n_long)
-            mean_used_px, sa_used_px = mean_long_px, sa_long_px
+        s_used = s_short if suggestion == "short" else s_long
+
+        # Area fields (traceability)
+        sa_used_px = _safe_float(s_used["area_sum"])
+        sa_long_px = _safe_float(s_long["area_sum"])
+        sa_short_px = _safe_float(s_short["area_sum"])
+
+        mean_used_px = _safe_float(s_used["area_mean"])
+        mean_long_px = _safe_float(s_long["area_mean"])
+        mean_short_px = _safe_float(s_short["area_mean"])
 
         area_frac_used = normalize_area_fraction(sa_used_px, h, w)
         area_frac_long = normalize_area_fraction(sa_long_px, h, w)
         area_frac_short = normalize_area_fraction(sa_short_px, h, w)
 
-        # Physical units if calibration provided
+        # Physical units if calibration provided (area only)
         mean_used_mm2 = _safe_float(mean_used_px) * px_area_mm2 if np.isfinite(px_area_mm2) else float("nan")
         sa_used_mm2 = _safe_float(sa_used_px) * px_area_mm2 if np.isfinite(px_area_mm2) else float("nan")
 
@@ -946,23 +1047,33 @@ for i, (orig_name, sid) in enumerate(zip(orig_names, sample_ids)):
                 "ALV_long_count": int(n_long),
                 "ALV_short_count": int(n_short),
                 "suggested": suggestion,
-                "ALV_n_used": int(n_used),
-                # used (px)
-                "ALV_mean_size_used_px": _safe_float(mean_used_px),
-                "ALV_surface_area_used_px": _safe_float(sa_used_px),
-                # used (recommended)
+                "ALV_n_used": int(s_used["n"]),
+                # Protocol-first metrics (perimeter)
+                "ALV_mean_perim_used_px": _safe_float(s_used["perim_mean"]),
+                "ALV_sd_perim_used_px": _safe_float(s_used["perim_sd"]),
+                "ALV_cv_perim_used": _safe_float(s_used["perim_cv"]),
+                "ALV_sum_perim_used_px": _safe_float(s_used["perim_sum"]),
+                "ALV_mean_perim_long_px": _safe_float(s_long["perim_mean"]),
+                "ALV_sd_perim_long_px": _safe_float(s_long["perim_sd"]),
+                "ALV_cv_perim_long": _safe_float(s_long["perim_cv"]),
+                "ALV_sum_perim_long_px": _safe_float(s_long["perim_sum"]),
+                "ALV_mean_perim_short_px": _safe_float(s_short["perim_mean"]),
+                "ALV_sd_perim_short_px": _safe_float(s_short["perim_sd"]),
+                "ALV_cv_perim_short": _safe_float(s_short["perim_cv"]),
+                "ALV_sum_perim_short_px": _safe_float(s_short["perim_sum"]),
+                # Traceability area fields (kept from previous schema)
+                "ALV_mean_size_used_px": mean_used_px,
+                "ALV_surface_area_used_px": sa_used_px,
                 "ALV_surface_area_used_frac": _safe_float(area_frac_used),
                 "ALV_mean_size_used_mm2": _safe_float(mean_used_mm2),
                 "ALV_surface_area_used_mm2": _safe_float(sa_used_mm2),
-                # long
-                "ALV_mean_size_long_px": _safe_float(mean_long_px),
-                "ALV_surface_area_long_px": _safe_float(sa_long_px),
+                "ALV_mean_size_long_px": mean_long_px,
+                "ALV_surface_area_long_px": sa_long_px,
                 "ALV_surface_area_long_frac": _safe_float(area_frac_long),
                 "ALV_mean_size_long_mm2": _safe_float(mean_long_mm2),
                 "ALV_surface_area_long_mm2": _safe_float(sa_long_mm2),
-                # short
-                "ALV_mean_size_short_px": _safe_float(mean_short_px),
-                "ALV_surface_area_short_px": _safe_float(sa_short_px),
+                "ALV_mean_size_short_px": mean_short_px,
+                "ALV_surface_area_short_px": sa_short_px,
                 "ALV_surface_area_short_frac": _safe_float(area_frac_short),
                 "ALV_mean_size_short_mm2": _safe_float(mean_short_mm2),
                 "ALV_surface_area_short_mm2": _safe_float(sa_short_mm2),
@@ -972,10 +1083,9 @@ for i, (orig_name, sid) in enumerate(zip(orig_names, sample_ids)):
             }
         )
 
-        # Particle tables: keep schema identical to your current app
+        # Particle tables: keep shape similar + include perimeter for ALV
         if include_particle_tables:
             # DEC particles already handled above
-            # ALV: use Python-derived tables (even if Fiji used) because they exist and match previous output shape.
             if not alv_all_long.empty:
                 tl = alv_all_long.copy()
                 tl.insert(0, "sample_id", sid)
@@ -1001,7 +1111,7 @@ for i, (orig_name, sid) in enumerate(zip(orig_names, sample_ids)):
     except Exception as e:
         errors.append({"sample_id": sid, "error": str(e)})
 
-        # Keep your error-row schema exactly
+        # Keep error-row schema exactly (include new ALV perimeter columns as NaN)
         dec_counts_rows.append({"sample_id": sid, "DEC_count": np.nan})
         alv_counts_rows.append(
             {
@@ -1010,6 +1120,18 @@ for i, (orig_name, sid) in enumerate(zip(orig_names, sample_ids)):
                 "ALV_short_count": np.nan,
                 "suggested": "error",
                 "ALV_n_used": np.nan,
+                "ALV_mean_perim_used_px": np.nan,
+                "ALV_sd_perim_used_px": np.nan,
+                "ALV_cv_perim_used": np.nan,
+                "ALV_sum_perim_used_px": np.nan,
+                "ALV_mean_perim_long_px": np.nan,
+                "ALV_sd_perim_long_px": np.nan,
+                "ALV_cv_perim_long": np.nan,
+                "ALV_sum_perim_long_px": np.nan,
+                "ALV_mean_perim_short_px": np.nan,
+                "ALV_sd_perim_short_px": np.nan,
+                "ALV_cv_perim_short": np.nan,
+                "ALV_sum_perim_short_px": np.nan,
                 "ALV_mean_size_used_px": np.nan,
                 "ALV_surface_area_used_px": np.nan,
                 "ALV_surface_area_used_frac": np.nan,
@@ -1035,7 +1157,7 @@ for i, (orig_name, sid) in enumerate(zip(orig_names, sample_ids)):
 progress.empty()
 status.empty()
 
-# Assemble dataframes (same)
+# Assemble dataframes
 dec_counts_df = pd.DataFrame(dec_counts_rows).sort_values("sample_id").reset_index(drop=True)
 dec_particles_df = pd.concat(dec_particles_rows, ignore_index=True) if dec_particles_rows else pd.DataFrame()
 
@@ -1047,12 +1169,12 @@ errors_df = pd.DataFrame(errors) if errors else pd.DataFrame(columns=["sample_id
 # Outputs always use original image names; no anonymisation swap needed.
 export_name_map = None
 
-# Display + downloads (same layout)
+# Display + downloads (layout preserved)
 c1, c2 = st.columns(2)
 
 with c1:
     st.subheader("Part I — DEC counts")
-    st.dataframe(dec_counts_df, width="stretch")
+    st.dataframe(dec_counts_df, use_container_width=True)
 
     dec_sheets = {"DEC_counts": dec_counts_df}
     if include_particle_tables:
@@ -1067,12 +1189,12 @@ with c1:
         data=dec_excel,
         file_name="DEC_results.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        width="stretch",
+        use_container_width=True,
     )
 
 with c2:
     st.subheader("Part II — Alveolar counts (Long vs Short)")
-    st.dataframe(alv_counts_df, width="stretch")
+    st.dataframe(alv_counts_df, use_container_width=True)
 
     alv_sheets = {"ALV_counts": alv_counts_df}
     if include_particle_tables:
@@ -1087,14 +1209,14 @@ with c2:
         data=alv_excel,
         file_name="ALV_results.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        width="stretch",
+        use_container_width=True,
     )
 
 if not errors_df.empty:
     st.warning(f"{len(errors_df)} image(s) failed.")
-    st.dataframe(errors_df, width="stretch")
+    st.dataframe(errors_df, use_container_width=True)
 
-# QC preview (same)
+# QC preview (layout preserved)
 st.divider()
 st.subheader(f"QC preview (first {len(qc_previews)} samples)")
 st.caption("Left→Right: Original, DEC detected, ALV long, ALV short")
@@ -1104,16 +1226,16 @@ for sid, orig_j, dec_j, long_j, short_j in qc_previews:
     r1, r2, r3, r4 = st.columns(4)
     with r1:
         if orig_j:
-            st.image(orig_j, caption="Original", width="stretch")
+            st.image(orig_j, caption="Original", use_container_width=True)
     with r2:
         if dec_j:
-            st.image(dec_j, caption="DEC overlay", width="stretch")
+            st.image(dec_j, caption="DEC overlay", use_container_width=True)
     with r3:
         if long_j:
-            st.image(long_j, caption="ALV long overlay", width="stretch")
+            st.image(long_j, caption="ALV long overlay", use_container_width=True)
     with r4:
         if short_j:
-            st.image(short_j, caption="ALV short overlay", width="stretch")
+            st.image(short_j, caption="ALV short overlay", use_container_width=True)
 
 # Bundle ZIP (same)
 bundle = make_bundle_zip(
@@ -1130,7 +1252,7 @@ st.download_button(
     data=bundle,
     file_name="dec_alv_outputs_bundle.zip",
     mime="application/zip",
-    width="stretch",
+    use_container_width=True,
 )
 
 st.divider()
@@ -1143,11 +1265,14 @@ st.markdown(
   - delete if Mode > cutoff
   - delete if Round < round_min
   - delete if AR > ar_max
+- **ALV is protocol-aligned**:
+  - uses **Analyze Particles exclude** behaviour (drops edge-touching units)
+  - reports **perimeter** mean/SD/CV (plus area for traceability)
 - Alveolar: runs both long/short and suggests one, but QC overlay is the real check.
-- ALV summary fields:
-  - `*_px` are raw pixel-area units (traceability)
+- ALV traceability fields:
+  - `*_px` are raw pixel units
   - `*_frac` is surface-area fraction (sum area / image area)
   - `*_mm2` require Calibration µm/px and report physical mm²
-- If you enable **Fiji/ImageJ**, ALV counts/areas come from headless Fiji; overlays still come from the Python pipeline for consistent QC bundle images.
+- If you enable **Fiji/ImageJ**, ALV counts/area/perimeter come from headless Fiji; overlays still come from the Python pipeline for consistent QC bundle images.
 """
 )
