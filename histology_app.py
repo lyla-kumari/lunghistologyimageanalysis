@@ -505,16 +505,25 @@ FIJI_DEFAULTS = [
 ]
 
 
+def _is_executable_file(p: Path) -> bool:
+    if not p.exists() or not p.is_file():
+        return False
+    # On Windows, the executable bit isn't meaningful.
+    if os.name == "nt":
+        return p.suffix.lower() in {".exe", ".bat", ".cmd"}
+    return os.access(str(p), os.X_OK)
+
+
 def _find_fiji_executable(user_path: str) -> Optional[str]:
     """Return an executable path to Fiji/ImageJ or None."""
     if user_path:
         p = Path(user_path).expanduser()
-        if p.exists() and os.access(str(p), os.X_OK):
+        if _is_executable_file(p):
             return str(p)
 
     for guess in FIJI_DEFAULTS:
         p = Path(guess)
-        if p.exists() and os.access(str(p), os.X_OK):
+        if _is_executable_file(p):
             return str(p)
 
     return None
@@ -544,43 +553,61 @@ def run_fiji_alv_macro(
         raise ValueError("variant must be 'long' or 'short'")
 
     macro_template = r"""
-// Args: img=..., out=..., rolling=..., sat=..., sigma=..., min_area=..., variant=..., scale_dist=...
-args = getArgument();
-img = getValue(args, "img");
-out = getValue(args, "out");
-rolling = parseInt(getValue(args, "rolling"));
-sat = parseFloat(getValue(args, "sat"));
-sigma = parseFloat(getValue(args, "sigma"));
-min_area = parseFloat(getValue(args, "min_area"));
-variant = getValue(args, "variant");
-scale_dist = parseInt(getValue(args, "scale_dist"));
+    // Expect args like: img=/path/to.png,out=/path/to.csv,rolling=50,sat=20,sigma=2,min_area=100,variant=long,scale_dist=1104
+    function getArg(args, key) {
+        // returns value string or ""
+        items = split(args, ",");
+        for (i=0; i<items.length; i++) {
+            kv = split(items[i], "=");
+            if (kv.length >= 2) {
+                k = trim(kv[0]);
+                // re-join value in case it contains '='
+                v = kv[1];
+                if (kv.length > 2) {
+                    for (j=2; j<kv.length; j++) v = v + "=" + kv[j];
+                }
+                if (k == key) return trim(v);
+            }
+        }
+        return "";
+    }
 
-open(img);
+    args = getArgument();
+    img = getArg(args, "img");
+    out = getArg(args, "out");
+    rolling = parseInt(getArg(args, "rolling"));
+    sat = parseFloat(getArg(args, "sat"));
+    sigma = parseFloat(getArg(args, "sigma"));
+    min_area = parseFloat(getArg(args, "min_area"));
+    variant = getArg(args, "variant");
+    scale_dist = parseInt(getArg(args, "scale_dist"));
 
-// Match the documented ImageJ macros
-run("Set Scale...", "distance="+scale_dist+" known=1 pixel=1 unit=mm global");
-run("Subtract Background...", "rolling="+rolling+" light");
-run("Sharpen");
-run("Enhance Contrast...", "saturated="+sat);
-run("Find Edges");
-run("Gaussian Blur...", "sigma="+sigma);
-setOption("BlackBackground", false);
-run("Make Binary");
+    open(img);
 
-// Long macro: Close- then Invert (once)
-if (toLowerCase(variant) == "long") {
-    run("Close-");
-    run("Invert");
-}
+    // Set Scale (your existing choice)
+    run("Set Scale...", "distance="+scale_dist+" known=1 pixel=1 unit=mm global");
 
-// Measure area + perimeter, then analyze particles
-run("Set Measurements...", "area perimeter display redirect=None decimal=3");
-run("Analyze Particles...", "size="+min_area+"-Infinity pixel display exclude clear");
+    run("Subtract Background...", "rolling="+rolling+" light");
+    run("Sharpen");
+    run("Enhance Contrast...", "saturated="+sat);
+    run("Find Edges");
+    run("Gaussian Blur...", "sigma="+sigma);
+    setOption("BlackBackground", false);
+    run("Make Binary");
 
-// Persist results
-saveAs("Results", out);
-run("Close All");
-"""
+    if (toLowerCase(variant) == "long") {
+        run("Close-");
+        run("Invert");
+    }
+
+    run("Set Measurements...", "area perimeter display redirect=None decimal=3");
+    run("Analyze Particles...", "size="+min_area+"-Infinity pixel exclude clear");
+
+    // Save Results table as CSV
+    saveAs("Results", out);
+    run("Close All");
+    """
+
 
     def ij_arg_escape(p: str) -> str:
         # Fiji args are a single string; normalize separators
@@ -676,11 +703,11 @@ with st.sidebar:
 
     fiji_exe_upload = st.file_uploader(
         "Select Fiji executable (optional)",
-        type=["exe"],
+        type=["exe", "bat", "cmd"],
         accept_multiple_files=False,
         disabled=not use_fiji_for_alv,
         help=(
-            "Optional: on Windows, you can upload/select ImageJ-win64.exe. "
+            "Windows: select ImageJ-win64.exe (or a .bat/.cmd launcher). "
             "If you don't upload, the app will try default install locations or the manual path below."
         ),
     )
@@ -773,30 +800,51 @@ run_params = {
 # Resolve Fiji executable once
 fiji_exe = None
 if use_fiji_for_alv:
-    # If the user selected an exe via file-uploader, persist to a temp file.
-    if fiji_exe_upload is not None:
+    # Guard: Streamlit Cloud typically runs on Linux. A Windows .exe cannot be executed there.
+    up_name = str(getattr(fiji_exe_upload, "name", "")) if fiji_exe_upload is not None else ""
+    up_suffix = Path(up_name).suffix.lower() if up_name else ""
+    if os.name != "nt" and up_suffix == ".exe":
+        st.error(
+            "You selected a Windows Fiji executable (.exe), but this app is running on a non-Windows host (likely Linux/Streamlit Cloud).\n\n"
+            "This causes: [Errno 8] Exec format error.\n\n"
+            "Fix: switch **ALV analysis backend** to **Python (built-in)**, or run this app on Windows with Fiji installed, "
+            "or install Fiji for Linux and point to the Linux executable (e.g., ImageJ-linux64)."
+        )
+        st.stop()
+
+    # Preferred: user provides a path to an installed Fiji.
+    fiji_exe = _find_fiji_executable(fiji_path) if fiji_path else None
+
+    # Optional: user uploads a launcher (primarily useful on Windows local runs)
+    # NOTE: this runs the uploaded binary on the server hosting Streamlit.
+    if fiji_exe is None and fiji_exe_upload is not None:
         try:
-            suffix = ".exe" if str(getattr(fiji_exe_upload, "name", "")).lower().endswith(".exe") else ""
+            up_name = str(getattr(fiji_exe_upload, "name", ""))
+            suffix = Path(up_name).suffix
             fd, tmp_path = tempfile.mkstemp(prefix="fiji_exe_", suffix=suffix)
             os.close(fd)
             Path(tmp_path).write_bytes(fiji_exe_upload.getvalue())
-            # Mark executable (best-effort). On Windows this is not required.
             try:
                 os.chmod(tmp_path, 0o755)
             except Exception:
                 pass
-            fiji_exe = tmp_path
+            if _is_executable_file(Path(tmp_path)):
+                fiji_exe = tmp_path
         except Exception as e:
             st.error(f"Could not use uploaded Fiji executable: {e}")
             st.stop()
-    else:
-        fiji_exe = _find_fiji_executable(fiji_path)
+
+    # Fallback: probe common install locations
+    if fiji_exe is None:
+        fiji_exe = _find_fiji_executable("")
 
     if not fiji_exe:
         st.error(
-            "Fiji/ImageJ not found or not executable. "
-            "Install Fiji and set the executable path. "
-            "Examples: macOS /Applications/Fiji.app/ImageJ-macosx | Windows C:/Fiji.app/ImageJ-win64.exe"
+            "Fiji/ImageJ not found or not executable.\n\n"
+            "Fixes:\n"
+            "- Ensure Fiji is installed on the machine running this Streamlit app\n"
+            "- Set the executable path (macOS: /Applications/Fiji.app/ImageJ-macosx | Windows: C:/Fiji.app/ImageJ-win64.exe)\n"
+            "- If running on Streamlit Cloud/Linux, a Windows .exe will not work; use the Python backend instead"
         )
         st.stop()
 
